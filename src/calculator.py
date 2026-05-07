@@ -223,7 +223,7 @@ def compute_summary(result_df: pd.DataFrame) -> pd.DataFrame:
         return np.std(x, ddof=1) / np.sqrt(len(x))
 
     summary = result_df.groupby(
-        ["target_gene", "group"], as_index=False
+        ["target_gene", "group"], as_index=False, sort=False
     ).agg(
         n=("normalized_data", "count"),
         fc_mean=("normalized_data", "mean"),

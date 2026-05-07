@@ -19,7 +19,10 @@ statsmodels>=0.14.0,<1.0.0
 plotly>=5.17.0,<7.0.0
 
 # Chart export (PNG 300DPI / SVG / PDF)
-kaleido>=0.2.1,<2.0.0
+# kaleido 0.1.0post1 bundles its own Chrome binary.
+# Local Windows may fail (Error code 1) — the app degrades gracefully
+# with a warning and falls back to the Plotly modebar camera button.
+kaleido==0.1.0post1
 
 # Excel read / write
 openpyxl>=3.1.0,<4.0.0

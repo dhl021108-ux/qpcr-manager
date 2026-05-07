@@ -59,16 +59,8 @@ def to_csv_bytes(result_df: pd.DataFrame) -> bytes:
     return result_df.to_csv(index=False).encode("utf-8-sig")
 
 
-def fig_to_png_bytes(fig: go.Figure, width: int = 1200, height: int = 800, scale: int = 2) -> bytes:
-    """Export Plotly figure as PNG bytes (300 dpi equivalent via scale)."""
-    return fig.to_image(format="png", width=width, height=height, scale=scale)
-
-
-def fig_to_svg_bytes(fig: go.Figure, width: int = 1200, height: int = 800) -> bytes:
-    """Export Plotly figure as SVG bytes."""
-    return fig.to_image(format="svg", width=width, height=height)
-
-
+# Chart export removed — use Plotly modebar camera button (frontend)
+# for PNG/SVG/PDF downloads. No kaleido/to_image dependency.
 def to_pdf_report(
     result_df: pd.DataFrame,
     summary_df: pd.DataFrame,

@@ -4,8 +4,10 @@
 使用方法: streamlit run app.py
 """
 
+import re
 from io import BytesIO
 from datetime import datetime
+from hashlib import sha256
 
 import numpy as np
 import pandas as pd
@@ -14,6 +16,7 @@ import streamlit as st
 from src.calculator import compute_full_table, compute_summary
 from src.statistics import run_pipeline, stats_to_dataframe
 from src.visualizer import prism_bar_chart, fig_to_bytes, PALETTES
+from src.tracker import track_login, get_user_stats
 
 # Dynamic date prefix for export filenames
 TODAY = datetime.now().strftime("%Y.%m.%d")
@@ -33,6 +36,44 @@ MAX_BIO_REPS = 10
 MIN_BIO_REPS = 2
 DEFAULT_BIO_REPS = 3
 
+EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+# ── 缓存计算函数（高并发优化） ───────────────────────────────
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_compute_full_table(_df_json, ref_col, target_col,
+                               control_group, sample_col, group_col):
+    """Cached wrapper for the 6-step pipeline."""
+    df = pd.read_json(_df_json)
+    return compute_full_table(df, ref_col, target_col, control_group,
+                              sample_col, group_col)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_compute_summary(_result_json):
+    """Cached wrapper for summary aggregation."""
+    result_df = pd.read_json(_result_json)
+    return compute_summary(result_df)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_run_stats(_result_json, control_group, test_method):
+    """Cached wrapper for statistical tests."""
+    result_df = pd.read_json(_result_json)
+    return run_pipeline(result_df, control_group, test_method=test_method)
+
+
+def cached_prism_chart(_summary_json, _result_json, _stats_json,
+                       target_gene, palette_name, error_type):
+    """Wrapper for Plotly chart generation — NO cache, must re-render every time."""
+    summary_df = pd.read_json(_summary_json)
+    result_df = pd.read_json(_result_json)
+    import json
+    stats_results = json.loads(_stats_json)
+    return prism_bar_chart(summary_df, result_df, stats_results,
+                           target_gene, palette_name, error_type)
+
+
 # ── 会话状态初始化 ───────────────────────────────────────────
 defaults = {
     "groups": DEFAULT_GROUPS.copy(),
@@ -49,10 +90,70 @@ defaults = {
     "last_bio_hash": "",
     "last_ref_name": "",
     "last_target_name": "",
+    # Login state
+    "logged_in": False,
+    "user_email": None,
+    "login_shown": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ── 免密邮箱登录弹窗 ─────────────────────────────────────────
+
+def show_login():
+    """Show the one-time login dialog."""
+    st.markdown("## 欢迎使用 qPCR 数据管理器")
+    st.caption("对标 GraphPad Prism 的学术级 qPCR 分析工具")
+
+    email = st.text_input(
+        "📧 邮箱地址（选填，无需密码）",
+        placeholder="your@institution.edu",
+        key="login_email_input",
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("✅ 验证并登录", use_container_width=True, type="primary"):
+            if not email.strip():
+                st.error("请输入邮箱地址")
+            elif not EMAIL_RE.match(email.strip()):
+                st.error("邮箱格式不正确，请重新输入")
+            else:
+                email_clean = email.strip().lower()
+                result = track_login(email_clean)
+                st.session_state.user_email = email_clean
+                st.session_state.logged_in = True
+                st.session_state.login_shown = True
+                st.success(
+                    f"登录成功！欢迎回来，这是您第 **{result['usage_count']}** 次使用。"
+                )
+                st.rerun()
+
+    with c2:
+        if st.button("⏭ 跳过，直接使用", use_container_width=True):
+            st.session_state.user_email = None
+            st.session_state.logged_in = True
+            st.session_state.login_shown = True
+            st.rerun()
+
+    st.divider()
+    st.caption("跳过登录不会影响任何功能，登录仅用于记录使用次数。")
+
+    # Show welcome-back message for returning users
+    if st.session_state.user_email:
+        stats = get_user_stats(st.session_state.user_email)
+        if stats:
+            st.info(
+                f"欢迎回来 **{st.session_state.user_email}** ！"
+                f"上次使用：{stats['last_login_date']}，"
+                f"累计使用 **{stats['usage_count']}** 次。"
+            )
+
+
+if not st.session_state.logged_in:
+    show_login()
+    st.stop()
 
 
 # ── 工具函数 ─────────────────────────────────────────────────
@@ -423,22 +524,20 @@ if do_calc:
     work_df[group_col] = work_df[group_col].ffill()
 
     try:
-        full_table, per_sample_result = compute_full_table(
-            work_df,
-            ref_col=ref_ct_col,
-            target_col=target_ct_col,
-            control_group=control_group,
-            sample_col=sample_col,
-            group_col=group_col,
+        # Use cached wrappers for 100-user concurrency
+        full_table, per_sample_result = cached_compute_full_table(
+            work_df.to_json(),
+            ref_ct_col, target_ct_col, control_group,
+            sample_col, group_col,
         )
-        summary_df = compute_summary(per_sample_result)
+        summary_df = cached_compute_summary(per_sample_result.to_json())
 
         if selected_test == "none":
             stats_results = {}
         else:
             pipeline_test = selected_test if selected_test in ("ttest", "mannwhitney") else "auto"
-            stats_results = run_pipeline(
-                per_sample_result, control_group, test_method=pipeline_test,
+            stats_results = cached_run_stats(
+                per_sample_result.to_json(), control_group, pipeline_test,
             )
 
         st.session_state.full_table = full_table
@@ -536,32 +635,58 @@ if st.session_state.computed:
         )
 
     try:
-        fig_prism = prism_bar_chart(
-            summary_df, result_df, stats_results,
-            target_gene=target_ct_col,
-            palette_name=selected_palette,
-            error_type=error_type,
+        import json
+        fig_prism = cached_prism_chart(
+            summary_df.to_json(), result_df.to_json(),
+            json.dumps(stats_results, default=str),
+            target_ct_col, selected_palette, error_type,
         )
-        st.plotly_chart(fig_prism, use_container_width=True)
+        st.plotly_chart(fig_prism, use_container_width=True, config={
+            'displayModeBar': True,
+            'toImageButtonOptions': {
+                'format': 'svg',
+                'filename': f'qPCR_{target_gene_name}',
+                'scale': 1,
+            },
+        })
 
+        # ── 图片下载（后端 kaleido 导出，云端兼容，本地退化提示）──
         dl1, dl2, dl3 = st.columns(3)
+        kaleido_failed = False
         with dl1:
-            st.download_button(
-                "下载 SVG", data=fig_to_bytes(fig_prism, "svg"),
-                file_name=f"{TODAY}_qPCR_{target_gene_name}.svg",
-                mime="image/svg+xml",
-            )
+            svg_data = fig_to_bytes(fig_prism, "svg")
+            if svg_data is not None:
+                st.download_button(
+                    "下载 SVG", data=svg_data,
+                    file_name=f"{TODAY}_qPCR_{target_gene_name}.svg",
+                    mime="image/svg+xml",
+                )
+            else:
+                kaleido_failed = True
         with dl2:
-            st.download_button(
-                "下载 PNG (300dpi)", data=fig_to_bytes(fig_prism, "png"),
-                file_name=f"{TODAY}_qPCR_{target_gene_name}.png",
-                mime="image/png",
-            )
+            png_data = fig_to_bytes(fig_prism, "png")
+            if png_data is not None:
+                st.download_button(
+                    "下载 PNG (300dpi)", data=png_data,
+                    file_name=f"{TODAY}_qPCR_{target_gene_name}.png",
+                    mime="image/png",
+                )
+            else:
+                kaleido_failed = True
         with dl3:
-            st.download_button(
-                "下载 PDF", data=fig_to_bytes(fig_prism, "pdf"),
-                file_name=f"{TODAY}_qPCR_{target_gene_name}.pdf",
-                mime="application/pdf",
+            pdf_data = fig_to_bytes(fig_prism, "pdf")
+            if pdf_data is not None:
+                st.download_button(
+                    "下载 PDF", data=pdf_data,
+                    file_name=f"{TODAY}_qPCR_{target_gene_name}.pdf",
+                    mime="application/pdf",
+                )
+            else:
+                kaleido_failed = True
+        if kaleido_failed:
+            st.warning(
+                "本地环境暂不支持导出图片，请部署到云端后使用下载功能。"
+                "您仍可通过图表右上角的照相机按钮下载 SVG。"
             )
     except Exception as e:
         st.error(f"图表渲染出错：{e}")

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""GraphPad Prism-style Plotly charts — 600x600, academic palettes, solid dots.
+"""GraphPad Prism-style Plotly charts — 800x800, academic palettes, solid dots.
 
 Features:
-  - 600x600 square canvas
+  - 800x800 square canvas
   - 10 muted academic palettes (Cell / Nature / PNAS style)
   - Solid black data points
   - Black SEM error bars
@@ -77,7 +77,7 @@ def prism_bar_chart(
     palette_name: str = "Cell 期刊 (Cell)",
     error_type: str = "SEM",
 ) -> go.Figure:
-    """GraphPad Prism-style bar chart — 600x600, solid dots, sig brackets.
+    """GraphPad Prism-style bar chart — 800x800, solid dots, sig brackets.
 
     Args:
         summary_df: From compute_summary().
@@ -102,7 +102,9 @@ def prism_bar_chart(
     if sdf.empty:
         return _empty_fig(f"No data for {target_gene}")
 
-    groups = sdf["group"].tolist()
+    # Lock X-axis order to input sequence (no alphabetical sort)
+    ordered_groups = rdf["group"].unique().tolist()
+    groups = [g for g in ordered_groups if g in sdf["group"].tolist()]
     n_groups = len(groups)
     colors = PALETTES.get(palette_name, PALETTES["Cell 期刊 (Cell)"])
     group_colors = [colors[i % len(colors)] for i in range(n_groups)]
@@ -128,9 +130,9 @@ def prism_bar_chart(
         name="Mean",
         showlegend=False,
         hovertemplate=(
-            "<b>%{customdata}</b><br>"
-            "Mean = %{y:.4f}<br>"
-            f"{error_type} = %{{error_y.array:.4f}}"
+            "%{customdata}"
+            " | Mean = %{y:.4f}"
+            f" | {error_type} = %{{error_y.array:.4f}}"
             "<extra></extra>"
         ),
         customdata=groups,
@@ -171,28 +173,41 @@ def prism_bar_chart(
         stats_results, groups, target_gene, group_to_x,
     )
 
-    if brackets:
-        all_y_vals = []
-        for grp in groups:
-            vals = rdf.loc[rdf["group"] == grp, "normalized_data"].dropna()
-            all_y_vals.extend(vals.tolist())
-        if all_y_vals:
-            y_max = max(all_y_vals)
-            y_range = (
-                y_max - min(all_y_vals)
-                if len(set(all_y_vals)) > 1
-                else y_max * 0.1
-            )
-        else:
-            y_max = max(fc_means) if fc_means else 1
-            y_range = y_max * 0.2
+    # ── Compute max data Y (bars + error + scatter) for safe axis range ──
+    max_data_y = 0.0
+    # Bar tops: mean + error
+    for i, grp in enumerate(groups):
+        mean_val = fc_means[i] if i < len(fc_means) else 0
+        err_val = fc_errors[i] if i < len(fc_errors) else 0
+        bar_top = mean_val + err_val
+        if bar_top > max_data_y:
+            max_data_y = bar_top
+    # Scatter points
+    for grp in groups:
+        grp_vals = rdf.loc[rdf["group"] == grp, "normalized_data"].dropna()
+        if len(grp_vals) > 0:
+            grp_max = grp_vals.max()
+            if grp_max > max_data_y:
+                max_data_y = grp_max
+    if max_data_y <= 0:
+        max_data_y = 1.0
 
+    # Y-axis ceiling with 30% headroom for brackets
+    y_axis_top = max_data_y * 1.3
+    # Brackets must stay below 25% headroom
+    bracket_ceiling = max_data_y * 1.25
+
+    if brackets:
         brackets.sort(key=lambda b: b["x1"] - b["x0"], reverse=True)
+        n_brackets = len(brackets)
+        # Distribute brackets evenly in the safe zone [max_data_y, bracket_ceiling]
+        bracket_zone = bracket_ceiling - max_data_y  # max_data_y * 0.25
+        tier_step = bracket_zone / (n_brackets + 1)
 
         for tier, b in enumerate(brackets):
             x0, x1 = b["x0"], b["x1"]
-            y_bracket = y_max + y_range * 0.15 + tier * y_range * 0.18
-            y_text = y_bracket + y_range * 0.04
+            y_bracket = max_data_y + tier_step * (tier + 1)
+            y_text = y_bracket + max_data_y * 0.03
 
             fig.add_shape(
                 type="line",
@@ -202,13 +217,13 @@ def prism_bar_chart(
             fig.add_shape(
                 type="line",
                 x0=x0, x1=x0,
-                y0=y_bracket - y_range * 0.02, y1=y_bracket,
+                y0=y_bracket - max_data_y * 0.015, y1=y_bracket,
                 line=dict(color="black", width=1.2),
             )
             fig.add_shape(
                 type="line",
                 x0=x1, x1=x1,
-                y0=y_bracket - y_range * 0.02, y1=y_bracket,
+                y0=y_bracket - max_data_y * 0.015, y1=y_bracket,
                 line=dict(color="black", width=1.2),
             )
 
@@ -217,11 +232,12 @@ def prism_bar_chart(
                 y=y_text,
                 text=b["label"],
                 showarrow=False,
-                font=dict(size=16, color="black", family="Arial"),
+                font=dict(size=14, color="black", family="Arial"),
             )
 
     # ── Prism-style layout (800x800 square, journal-ready) ──
-    FONT_SIZE = 15
+    # Safe font sizes — capped to prevent text overflow
+    AXIS_TITLE_SIZE = 14
     TICK_SIZE = 14
     TITLE_SIZE = 20
 
@@ -250,9 +266,10 @@ def prism_bar_chart(
 
     fig.update_yaxes(
         title={
-            "text": "Relative mRNA fold change",
-            "font": {"size": FONT_SIZE, "color": "black", "family": "Arial"},
+            "text": "Relative mRNA Expression (Fold Change)",
+            "font": {"size": AXIS_TITLE_SIZE, "color": "black", "family": "Arial"},
         },
+        range=[0, y_axis_top],
         showline=True,
         linecolor="black",
         linewidth=1.2,
@@ -273,7 +290,7 @@ def prism_bar_chart(
         plot_bgcolor="white",
         paper_bgcolor="white",
         bargap=0.30,
-        margin=dict(l=80, r=50, t=100, b=80),
+        margin=dict(t=80, b=60, l=60, r=20),
         title={
             "text": target_gene,
             "font": {
@@ -283,7 +300,7 @@ def prism_bar_chart(
             "x": 0.5,
             "xanchor": "center",
         },
-        font=dict(family="Arial, sans-serif", size=FONT_SIZE, color="black"),
+        font=dict(family="Arial, sans-serif", size=AXIS_TITLE_SIZE, color="black"),
         showlegend=False,
         hovermode="closest",
     )
@@ -294,14 +311,19 @@ def prism_bar_chart(
 def fig_to_bytes(
     fig: go.Figure,
     fmt: str = "png",
-) -> bytes:
+) -> bytes | None:
     """Export Plotly figure to png / svg / pdf bytes.
 
+    Returns None on Kaleido failure (local Windows without Chrome).
+    Caller must handle None gracefully.
     All formats use 800x800 square canvas.
     PNG uses scale=3 for 300+ DPI journal submission quality.
     """
-    if fmt == "svg":
-        return fig.to_image(format="svg", width=800, height=800)
-    elif fmt == "pdf":
-        return fig.to_image(format="pdf", width=800, height=800)
-    return fig.to_image(format="png", width=800, height=800, scale=3)
+    try:
+        if fmt == "svg":
+            return fig.to_image(format="svg", width=800, height=800)
+        elif fmt == "pdf":
+            return fig.to_image(format="pdf", width=800, height=800)
+        return fig.to_image(format="png", width=800, height=800, scale=3)
+    except Exception:
+        return None
