@@ -4,6 +4,8 @@
 使用方法: streamlit run app.py
 """
 
+import io
+import json
 import re
 from io import BytesIO
 from datetime import datetime
@@ -44,7 +46,7 @@ EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 def cached_compute_full_table(_df_json, ref_col, target_col,
                                control_group, sample_col, group_col):
     """Cached wrapper for the 6-step pipeline."""
-    df = pd.read_json(_df_json)
+    df = pd.read_json(io.StringIO(_df_json))
     return compute_full_table(df, ref_col, target_col, control_group,
                               sample_col, group_col)
 
@@ -52,23 +54,22 @@ def cached_compute_full_table(_df_json, ref_col, target_col,
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_compute_summary(_result_json):
     """Cached wrapper for summary aggregation."""
-    result_df = pd.read_json(_result_json)
+    result_df = pd.read_json(io.StringIO(_result_json))
     return compute_summary(result_df)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def cached_run_stats(_result_json, control_group, test_method):
     """Cached wrapper for statistical tests."""
-    result_df = pd.read_json(_result_json)
+    result_df = pd.read_json(io.StringIO(_result_json))
     return run_pipeline(result_df, control_group, test_method=test_method)
 
 
 def cached_prism_chart(_summary_json, _result_json, _stats_json,
                        target_gene, palette_name, error_type):
     """Wrapper for Plotly chart generation — NO cache, must re-render every time."""
-    summary_df = pd.read_json(_summary_json)
-    result_df = pd.read_json(_result_json)
-    import json
+    summary_df = pd.read_json(io.StringIO(_summary_json))
+    result_df = pd.read_json(io.StringIO(_result_json))
     stats_results = json.loads(_stats_json)
     return prism_bar_chart(summary_df, result_df, stats_results,
                            target_gene, palette_name, error_type)
@@ -196,18 +197,13 @@ def rebuild_df_preserving(old_df, groups, n_bio_reps, ref_col, target_col):
 
 
 def build_result_html(full_table, ref_name, target_name):
-    """构建逐孔结果表格 (HTML)，智能合并且格，保留原始行顺序。
-
-    3 个或以上连续相同值的单元格自动合并 (rowspan)，垂直居中。
-    """
+    """构建逐孔结果表格 (HTML)，智能合并且格，保留原始行顺序。"""
     if full_table is None or full_table.empty:
         return "<p>暂无结果数据</p>"
 
-    # Preserve original row order — NO sorting
     df = full_table.copy().reset_index(drop=True)
     n_rows = len(df)
 
-    # Columns to display (in order)
     display_cols = [
         ("分组",      "分组",            "center"),
         ("样本",      "样本",            "center"),
@@ -229,8 +225,6 @@ def build_result_html(full_table, ref_name, target_name):
         "mean2": "{:.4f}", "mean3": "{:.4f}", "归一化数据": "{:.4f}",
     }
 
-    # ── Precompute rowspan metadata for each column ─────────
-    # For each cell: (should_render: bool, rowspan: int)
     col_meta = {}
     for key, _, _ in display_cols:
         meta = []
@@ -257,7 +251,6 @@ def build_result_html(full_table, ref_name, target_name):
             i = j
         col_meta[key] = meta
 
-    # ── Build HTML ──────────────────────────────────────────
     css = '''
     <style>
     .qpcr-table { border-collapse: collapse; width: 100%; font-size: 13px;
@@ -286,7 +279,7 @@ def build_result_html(full_table, ref_name, target_name):
         for key, _, align in display_cols:
             render, rowspan = col_meta[key][row_idx]
             if not render:
-                continue  # consumed by a previous rowspan
+                continue
 
             val = df.iloc[row_idx].get(key, np.nan)
             if key in fmt and pd.notna(val):
@@ -635,7 +628,6 @@ if st.session_state.computed:
         )
 
     try:
-        import json
         fig_prism = cached_prism_chart(
             summary_df.to_json(), result_df.to_json(),
             json.dumps(stats_results, default=str),
