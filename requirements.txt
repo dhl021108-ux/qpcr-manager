@@ -1,0 +1,35 @@
+# ============================================================
+# qPCR Data Manager — Production Dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+# Python >= 3.10 required
+
+# Core framework
+streamlit>=1.28.0,<1.60.0
+
+# Data processing
+pandas>=2.0.0,<3.0.0
+numpy>=1.24.0,<3.0.0
+
+# Statistical analysis (t-test / ANOVA / post-hoc)
+scipy>=1.11.0,<2.0.0
+statsmodels>=0.14.0,<1.0.0
+
+# Interactive charts
+plotly>=5.17.0,<7.0.0
+
+# Chart export (PNG 300DPI / SVG / PDF)
+kaleido>=0.2.1,<2.0.0
+
+# Excel read / write
+openpyxl>=3.1.0,<4.0.0
+
+# PDF report generation
+fpdf2>=2.7.0,<3.0.0
+
+# ============================================================
+# Development (optional)
+# ============================================================
+# pip install -r requirements.txt  already covers above.
+# For running tests:
+#   pip install pytest>=7.0.0,<10.0.0
