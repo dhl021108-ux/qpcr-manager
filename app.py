@@ -17,7 +17,7 @@ import streamlit as st
 
 from src.calculator import compute_full_table, compute_summary
 from src.exporter import plot_data_to_tsv
-from src.statistics import run_pipeline, stats_to_dataframe
+from src.statistics import run_pipeline, stats_to_dataframe, stats_matrix_to_html
 from src.visualizer import prism_bar_chart, fig_to_bytes, PALETTES
 from src.tracker import track_login, get_user_stats
 
@@ -45,34 +45,35 @@ EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 # ── 缓存计算函数（高并发优化） ───────────────────────────────
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_compute_full_table(_df_json, ref_col, target_col,
+def cached_compute_full_table(df_json, ref_col, target_col,
                                control_group, sample_col, group_col):
-    """Cached wrapper for the 6-step pipeline."""
-    df = pd.read_json(io.StringIO(_df_json))
+    """Cached wrapper for the 6-step pipeline. All params in cache key."""
+    df = pd.read_json(io.StringIO(df_json))
     return compute_full_table(df, ref_col, target_col, control_group,
                               sample_col, group_col)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_compute_summary(_result_json):
-    """Cached wrapper for summary aggregation."""
-    result_df = pd.read_json(io.StringIO(_result_json))
+def cached_compute_summary(result_json):
+    """Cached wrapper for summary aggregation. All params in cache key."""
+    result_df = pd.read_json(io.StringIO(result_json))
     return compute_summary(result_df)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_run_stats(_result_json, control_group, test_method):
-    """Cached wrapper for statistical tests."""
-    result_df = pd.read_json(io.StringIO(_result_json))
-    return run_pipeline(result_df, control_group, test_method=test_method)
+def cached_run_stats(result_json, control_group, test_method, data_col):
+    """Cached wrapper for statistical tests. All params in cache key."""
+    result_df = pd.read_json(io.StringIO(result_json))
+    return run_pipeline(result_df, control_group, test_method=test_method,
+                        data_col=data_col)
 
 
-def cached_prism_chart(_summary_json, _result_json, _stats_json,
+def cached_prism_chart(summary_json, result_json, stats_json,
                        target_gene, palette_name, error_type):
     """Wrapper for Plotly chart generation — NO cache, must re-render every time."""
-    summary_df = pd.read_json(io.StringIO(_summary_json))
-    result_df = pd.read_json(io.StringIO(_result_json))
-    stats_results = json.loads(_stats_json)
+    summary_df = pd.read_json(io.StringIO(summary_json))
+    result_df = pd.read_json(io.StringIO(result_json))
+    stats_results = json.loads(stats_json)
     return prism_bar_chart(summary_df, result_df, stats_results,
                            target_gene, palette_name, error_type)
 
@@ -90,6 +91,7 @@ defaults = {
     "stats_results": None,
     "full_table": None,
     "computed": False,
+    "_editor_backup": None,
     "last_groups_hash": "",
     "last_tech_hash": "",
     "last_bio_hash": "",
@@ -163,6 +165,95 @@ if not st.session_state.logged_in:
 
 # ── 工具函数 ─────────────────────────────────────────────────
 
+def _is_data_lost(edited_df, backup_df):
+    """Detect if data_editor returned a stale/reset state (e.g. after tab switch).
+
+    Returns True if `edited_df` appears to have lost data compared to `backup_df`.
+    """
+    if backup_df is None:
+        return False
+    if edited_df is None or edited_df.empty:
+        return backup_df is not None and not backup_df.empty
+    # Row count dropped significantly — likely a WS reconnect reset
+    if len(edited_df) < len(backup_df) * 0.5:
+        return True
+    # Data columns went from populated to all-NaN
+    # Use INTERSECTION of both DFs' columns — avoids KeyError when gene names change
+    meta_cols = {"样本", "分组", "Sample", "Group"}
+    backup_data_cols = {c for c in backup_df.columns if c not in meta_cols}
+    edited_data_cols = {c for c in edited_df.columns if c not in meta_cols}
+    common_cols = list(backup_data_cols & edited_data_cols)
+    if common_cols:
+        backup_has = backup_df[common_cols].notna().any().any()
+        edited_has = edited_df[common_cols].notna().any().any()
+        if backup_has and not edited_has:
+            return True
+    return False
+
+
+def _sanitize_editor_output(df):
+    """Fill missing group/sample labels for rows added via num_rows='dynamic'.
+
+    Strategy: ffill + bfill group labels, then generate sample names for rows
+    that still lack them.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+
+    group_col = "分组" if "分组" in df.columns else ("Group" if "Group" in df.columns else None)
+    sample_col = "样本" if "样本" in df.columns else ("Sample" if "Sample" in df.columns else None)
+
+    if group_col:
+        df[group_col] = df[group_col].replace("", np.nan)
+        df[group_col] = df[group_col].ffill().bfill()
+
+    if sample_col and group_col:
+        df[sample_col] = df[sample_col].replace("", np.nan)
+        # Fill NaN sample names: generate from group + running index
+        mask = df[sample_col].isna()
+        if mask.any():
+            counter = {}
+            for idx in df.index:
+                if pd.isna(df.at[idx, sample_col]):
+                    grp = str(df.at[idx, group_col]) if pd.notna(df.at[idx, group_col]) else "未分组"
+                    counter[grp] = counter.get(grp, 0) + 1
+                    df.at[idx, sample_col] = f"{grp}-{counter[grp]}"
+    return df
+
+
+def detect_control_group(groups):
+    """Auto-detect control group by scanning for WT / Wild-type labels.
+
+    Returns the group name if found, otherwise None.
+    """
+    wt_aliases = {"wt", "wild-type", "wild type", "wildtype", "w.t.", "wtc", "wt ctrl"}
+    for g in groups:
+        if g.strip().lower() in wt_aliases:
+            return g
+    return None
+
+
+def _enforce_size_limit(df, expected_rows, expected_cols):
+    """Truncate DataFrame to expected dimensions. Returns (df, truncated_rows, truncated_cols).
+
+    Silently discards excess rows/cols from copy-paste overflow without
+    expanding the group/replicate structure configured by the user.
+    """
+    truncated_rows = False
+    truncated_cols = False
+    if df is None or df.empty:
+        return df, truncated_rows, truncated_cols
+
+    if len(df) > expected_rows:
+        df = df.iloc[:expected_rows, :]
+        truncated_rows = True
+    if len(df.columns) > expected_cols:
+        df = df.iloc[:, :expected_cols]
+        truncated_cols = True
+    return df, truncated_rows, truncated_cols
+
+
 def build_default_df(groups, bio_reps_map, tech_reps, ref_col="GAPDH Ct", target_col="IL-6 Ct"):
     """构建初始数据表格 — 支持每组独立的生物学重复数和可变技术重复数。"""
     rows = []
@@ -182,22 +273,39 @@ def build_default_df(groups, bio_reps_map, tech_reps, ref_col="GAPDH Ct", target
 
 
 def rebuild_df_preserving(old_df, groups, bio_reps_map, tech_reps, ref_col, target_col):
-    """重建数据结构时保留已输入的 Ct 值。"""
+    """重建数据结构时保留已输入的 Ct 值，同时保留动态添加/删除的行。"""
     new_df = build_default_df(groups, bio_reps_map, tech_reps, ref_col, target_col)
-    if old_df is not None and not old_df.empty:
-        old_sample_col = "样本" if "样本" in old_df.columns else "Sample"
-        old_group_col = "分组" if "分组" in old_df.columns else "Group"
-        for col in [ref_col, target_col]:
-            if col in old_df.columns and col in new_df.columns:
-                for idx, row in new_df.iterrows():
-                    match = old_df.loc[
-                        (old_df[old_sample_col] == row["样本"]) &
-                        (old_df[old_group_col] == row["分组"])
-                    ]
-                    if not match.empty and col in match.columns:
-                        val = match[col].values[0]
-                        if pd.notna(val):
-                            new_df.at[idx, col] = val
+    if old_df is None or old_df.empty:
+        return new_df
+
+    old_sample_col = "样本" if "样本" in old_df.columns else "Sample"
+    old_group_col = "分组" if "分组" in old_df.columns else "Group"
+
+    # Copy Ct values for columns that exist in both old and new
+    old_data_cols = [c for c in old_df.columns if c not in (old_sample_col, old_group_col, "Sample", "Group")]
+    for col in old_data_cols:
+        if col in new_df.columns:
+            for idx, row in new_df.iterrows():
+                match = old_df.loc[
+                    (old_df[old_sample_col] == row[old_sample_col]) &
+                    (old_df[old_group_col] == row[old_group_col])
+                ]
+                if not match.empty and col in match.columns:
+                    val = match[col].values[0]
+                    if pd.notna(val):
+                        new_df.at[idx, col] = val
+
+    # Preserve dynamic rows from old_df that have Ct data but no match in new_df
+    # These are rows the user manually added via num_rows="dynamic"
+    if old_data_cols:
+        has_data = old_df[old_data_cols].notna().any(axis=1)
+        extra_rows = old_df[has_data & ~old_df[old_sample_col].isin(new_df[old_sample_col])]
+        if not extra_rows.empty:
+            for col in new_df.columns:
+                if col not in extra_rows.columns:
+                    extra_rows[col] = np.nan
+            new_df = pd.concat([new_df, extra_rows[new_df.columns]], ignore_index=True)
+
     return new_df
 
 
@@ -377,21 +485,19 @@ with ctrl_col3:
     ref_gene_name = st.text_input(
         "内参基因名称",
         value=st.session_state.ref_gene_name,
-        help="例如：GAPDH、ACTB、18S rRNA",
+        help="例如：GAPDH、ACTB、18S rRNA。修改后在下次操作时自动应用。",
     )
     if ref_gene_name != st.session_state.ref_gene_name:
         st.session_state.ref_gene_name = ref_gene_name
-        st.rerun()
 
 with ctrl_col4:
     target_gene_name = st.text_input(
         "目的基因名称",
         value=st.session_state.target_gene_name,
-        help="例如：IL-6、TNF-α、TP53",
+        help="例如：IL-6、TNF-α、TP53。修改后在下次操作时自动应用。",
     )
     if target_gene_name != st.session_state.target_gene_name:
         st.session_state.target_gene_name = target_gene_name
-        st.rerun()
 
 # ── Per-group biological replicate count ──
 if len(st.session_state.groups) > 0:
@@ -521,13 +627,51 @@ edited = st.data_editor(
     key="qpcr_editor",
 )
 
-st.session_state.editor_df = edited
+# ── Compute expected dimensions from user config ──
+expected_rows = sum(
+    st.session_state.bio_reps_map.get(g, DEFAULT_BIO_REPS) * st.session_state.tech_reps
+    for g in st.session_state.groups
+)
+expected_cols = len(data_cols)
+
+# ── Backup defense: prevent data loss on tab-switch / WS reconnect ──
+backup = st.session_state.get("_editor_backup")
+if _is_data_lost(edited, backup):
+    st.session_state.editor_df = backup.copy()
+else:
+    # Post-process: fill empty group/sample for dynamically added rows
+    edited = _sanitize_editor_output(edited)
+    # Enforce size limit: truncate copy-paste overflow silently
+    edited, did_truncate_rows, did_truncate_cols = _enforce_size_limit(
+        edited, expected_rows, expected_cols,
+    )
+    if did_truncate_rows or did_truncate_cols:
+        detail_parts = []
+        if did_truncate_rows:
+            detail_parts.append(f"行数（限制 {expected_rows} 行）")
+        if did_truncate_cols:
+            detail_parts.append(f"列数（限制 {expected_cols} 列）")
+        detail = "、".join(detail_parts)
+        st.warning(
+            f"粘贴的数据超过了预设范围（{detail}），系统已自动截断多余部分。"
+            f"如需调整，请修改上方的分组或复孔数配置。",
+            icon="⚠️",
+        )
+    st.session_state.editor_df = edited
+    st.session_state._editor_backup = edited.copy()
 
 # ── 计算按钮 + 统计检验方法选择 ─────────────────────────────
 st.divider()
 st.header("🔬 分析与检验")
 
-control_group = st.session_state.groups[0] if st.session_state.groups else "对照组"
+# ── Smart control group detection ──
+auto_control = detect_control_group(st.session_state.groups)
+if auto_control:
+    control_group = auto_control
+elif st.session_state.groups:
+    control_group = st.session_state.groups[0]
+else:
+    control_group = "对照组"
 
 n_effective_groups = len(st.session_state.groups)
 if n_effective_groups >= 3:
@@ -540,7 +684,7 @@ else:
     recommended_test = "none"
     recommended_label = "不进行检验（分组不足）"
 
-calc_col1, calc_col2, calc_col3 = st.columns([1, 1, 1])
+calc_col1, calc_col2, calc_col3, calc_col4 = st.columns([1, 1, 1, 1])
 with calc_col1:
     do_calc = st.button("🧪 开始分析", type="primary", use_container_width=True)
 
@@ -550,6 +694,7 @@ with calc_col2:
         "ttest": "Student's t 检验",
         "mannwhitney": "Mann-Whitney U 检验",
         "anova": "单因素方差分析 (ANOVA)",
+        "kruskal": "Kruskal-Wallis 检验",
         "none": "不进行统计检验",
     }
     test_keys = list(test_options.keys())
@@ -564,7 +709,21 @@ with calc_col2:
     )
 
 with calc_col3:
-    st.caption(f"对照组：**{control_group}**")
+    data_col_options = {"normalized_data": "Fold Change (归一化数据)",
+                        "delta_ct": "ΔCt (对数尺度)"}
+    selected_data_col = st.selectbox(
+        "统计检验对象",
+        options=list(data_col_options.keys()),
+        index=0,
+        format_func=lambda x: data_col_options[x],
+        help="归一化数据适合生物学解释；ΔCt 对数尺度近似正态，对标 GraphPad Prism。",
+    )
+
+with calc_col4:
+    if auto_control:
+        st.success(f"已自动识别 **{control_group}** 为对照组")
+    else:
+        st.caption(f"对照组：**{control_group}**")
     st.caption(f"有效分组数：**{n_effective_groups}** 组")
 
 if do_calc:
@@ -588,9 +747,10 @@ if do_calc:
         if selected_test == "none":
             stats_results = {}
         else:
-            pipeline_test = selected_test if selected_test in ("ttest", "mannwhitney") else "auto"
+            pipeline_test = selected_test
             stats_results = cached_run_stats(
                 per_sample_result.to_json(), control_group, pipeline_test,
+                selected_data_col,
             )
 
         st.session_state.full_table = full_table
@@ -657,14 +817,24 @@ if st.session_state.computed:
     if selected_test == "none" or not stats_results:
         st.info("已跳过统计检验（用户选择：不进行检验）。")
     else:
-        st.caption("统计检验基于 ΔΔCt 值（对数尺度），对标 GraphPad Prism。")
+        stats_label = "归一化数据 (Fold Change)" if selected_data_col == "normalized_data" else "ΔCt (对数尺度)"
+        st.caption(f"检验对象：**{stats_label}**  |  自动诊断正态性与方差齐性，选择最优检验路径。")
 
-        stats_df = stats_to_dataframe(stats_results)
-        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+        omnibus_df, matrix_dfs = stats_to_dataframe(stats_results)
+        st.dataframe(omnibus_df, use_container_width=True, hide_index=True)
 
+        # P-value matrix
+        if matrix_dfs:
+            st.markdown("### 🔢 P 值矩阵（所有组两两比较）")
+            matrix_html = stats_matrix_to_html(matrix_dfs)
+            st.markdown(matrix_html, unsafe_allow_html=True)
+
+        # Excel download
         stats_excel = BytesIO()
         with pd.ExcelWriter(stats_excel, engine="openpyxl") as w:
-            stats_df.to_excel(w, sheet_name="统计检验结果", index=False)
+            omnibus_df.to_excel(w, sheet_name="综合检验", index=False)
+            for gene, mat in matrix_dfs.items():
+                mat.to_excel(w, sheet_name=f"P值矩阵_{gene}")
         st.download_button(
             "下载统计检验结果 (Excel)",
             data=stats_excel.getvalue(),
@@ -717,27 +887,36 @@ if st.session_state.computed:
             target_ct_col, error_type,
         )
 
-        has_images = png_data is not None and pdf_data is not None
+        has_images = png_data is not None or pdf_data is not None
         if has_images:
-            dl1, dl2, dl3 = st.columns(3)
-            with dl1:
-                st.download_button(
-                    "下载 PNG (300dpi)", data=png_data,
-                    file_name=f"{TODAY}_qPCR_{target_gene_name}.png",
-                    mime="image/png",
-                )
-            with dl2:
-                st.download_button(
-                    "下载 PDF (矢量)", data=pdf_data,
-                    file_name=f"{TODAY}_qPCR_{target_gene_name}.pdf",
-                    mime="application/pdf",
-                )
-            with dl3:
-                st.download_button(
-                    "下载 TSV (作图数据)", data=tsv_str,
-                    file_name=f"{TODAY}_qPCR_{target_gene_name}_plot_data.tsv",
-                    mime="text/tab-separated-values",
-                )
+            cols = []
+            if png_data is not None:
+                cols.append(("png", png_data))
+            if pdf_data is not None:
+                cols.append(("pdf", pdf_data))
+            cols.append(("tsv", tsv_str))
+
+            dl_cols = st.columns(len(cols))
+            for i, (kind, data) in enumerate(cols):
+                with dl_cols[i]:
+                    if kind == "png":
+                        st.download_button(
+                            "下载 PNG (300dpi)", data=data,
+                            file_name=f"{TODAY}_qPCR_{target_gene_name}.png",
+                            mime="image/png",
+                        )
+                    elif kind == "pdf":
+                        st.download_button(
+                            "下载 PDF (矢量)", data=data,
+                            file_name=f"{TODAY}_qPCR_{target_gene_name}.pdf",
+                            mime="application/pdf",
+                        )
+                    else:
+                        st.download_button(
+                            "下载 TSV (作图数据)", data=data,
+                            file_name=f"{TODAY}_qPCR_{target_gene_name}_plot_data.tsv",
+                            mime="text/tab-separated-values",
+                        )
         else:
             st.download_button(
                 "下载 TSV (作图数据)", data=tsv_str,
